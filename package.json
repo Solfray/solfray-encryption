@@ -1,0 +1,34 @@
+{
+  "name": "@solfray/e2e",
+  "version": "0.0.1",
+  "description": "Solfray encryption lock and the keys.solfray.com vault. Not yet audited.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit && tsc -p vault --noEmit",
+    "test": "esbuild src/selftest.ts --bundle --platform=node --format=esm --outfile=/tmp/solfray-e2e-selftest.mjs && node /tmp/solfray-e2e-selftest.mjs",
+    "build:vault": "node scripts/build.mjs"
+  },
+  "dependencies": {
+    "@noble/ciphers": "1.2.1",
+    "@noble/curves": "1.8.1",
+    "@noble/hashes": "1.7.1",
+    "@scure/bip39": "1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.30",
+    "esbuild": "0.25.9",
+    "typescript": "5.5.4",
+    "uqr": "0.1.2"
+  }
+}

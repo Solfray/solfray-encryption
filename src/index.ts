@@ -1,0 +1,62 @@
+export {
+  SEED_LEN,
+  forgeSeed,
+  phraseFromSeed,
+  seedFromPhrase,
+  deriveAccount,
+  accountFromPhrase,
+  quizWords,
+  quizMatches,
+  pubB58,
+  sigilOf,
+  attestationText,
+  revokeText,
+  rotateText,
+  VAULT_SIGN_TEXT,
+  WALLET_BACKUP_WARNING,
+  verifyWalletSig,
+  signEncryption,
+  verifyEncryption,
+  type AccountKey,
+} from "./account.js";
+
+export {
+  chatRoom,
+  channelRoom,
+  aadBytes,
+  wrapEpochKey,
+  unwrapEpochKey,
+  newEpochKey,
+  MAX_PLAINTEXT,
+  MAX_ENVELOPE_LEN,
+  ENVELOPE_PREFIX,
+  sealMessage,
+  parseEnvelope,
+  verifyEnvelope,
+  openMessage,
+  epochSignBytes,
+  signEpoch,
+  verifyEpoch,
+  offVoteBytes,
+  signOffVote,
+  verifyOffVote,
+  sealBytes,
+  openBytes,
+  isOpaqueImage,
+  edPubFromB58,
+  type PlainMessage,
+  type EnvelopeParts,
+} from "./box.js";
+
+export {
+  VAULT_ARGON,
+  sealVault,
+  openVault,
+  passphrasePassword,
+  walletSignaturePassword,
+  vaultLockOf,
+  type VaultBlob,
+} from "./vault.js";
+
+export { bytesToB64url, b64urlToBytes, b64ToBytes, bytesToB64 } from "./codec.js";
+export { base58Encode, base58Decode, isWalletPk } from "./base58.js";
