@@ -16,8 +16,10 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit && tsc -p vault --noEmit",
-    "test": "esbuild src/selftest.ts --bundle --platform=node --format=esm --outfile=/tmp/solfray-e2e-selftest.mjs && node /tmp/solfray-e2e-selftest.mjs",
-    "build:vault": "node scripts/build.mjs"
+    "test": "esbuild src/selftest.ts --bundle --platform=node --format=esm --outfile=tmp/solfray-e2e-selftest.mjs && node tmp/solfray-e2e-selftest.mjs",
+    "build:vault": "node scripts/build.mjs",
+    "deploy": "wrangler deploy",
+    "preview": "wrangler dev"
   },
   "dependencies": {
     "@noble/ciphers": "1.2.1",
@@ -29,6 +31,7 @@
     "@types/node": "22.15.30",
     "esbuild": "0.25.9",
     "typescript": "5.5.4",
-    "uqr": "0.1.2"
+    "uqr": "0.1.2",
+    "wrangler": "^4.142.0"
   }
 }

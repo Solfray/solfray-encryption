@@ -8,12 +8,12 @@ Publishing this repo does not prove the Solfray website is honest. The site can 
 
 ## Deploy keys.solfray.com
 
-This hostname is a new Cloudflare Pages project. It is not part of `solfray-web`, and it has no Worker route.
+This hostname is its own static-assets Worker, `solfray-keys`, defined in `wrangler.jsonc`. It has no script. It is not part of `solfray-web` or the main Solfray Worker.
 
-1. Create a Pages project, for example `solfray-keys`.
-2. Connect this repo. Framework preset: None. Build command: leave empty. Build output directory: `dist`.
-3. On that project, add the custom domain `keys.solfray.com`. Cloudflare writes the DNS record and the certificate.
-4. Do not add `keys.solfray.com` to the `solfray-web` project. Do not add a Worker route for that hostname.
+1. Run `deploy.bat`. It typechecks, runs the self-test, rebuilds `dist/`, refuses if the rebuild differs from the commit, then runs `wrangler deploy`. `dist/_headers` sets the CSP and the other headers.
+2. In the dashboard, open Workers & Pages, then `solfray-keys`, then Settings, then Domains & Routes. Add the custom domain `keys.solfray.com`. Cloudflare writes the DNS record and the certificate.
+3. On the same screen, disable the `workers.dev` route so only `keys.solfray.com` serves the vault.
+4. Do not add `keys.solfray.com` to the `solfray-web` project. Do not route that hostname through the main Solfray Worker.
 
 The vault is a static page. It does not call the Solfray API and it must not see the login cookie. Deploy this project before the website that frames it, or the site will show that the vault did not answer. There is no fallback that keeps the seed on `solfray.com`.
 
