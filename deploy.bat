@@ -14,26 +14,48 @@ for /f %%t in ('powershell -NoProfile -Command "[int][double](Get-Date -UFormat 
 
 cd /d "%~dp0"
 
-if not exist node_modules (
-    echo === Installing dependencies ===
-    call npm ci
-    if errorlevel 1 goto :fail
+echo === 1/6 Installing exact locked dependencies ===
+rem Always a clean install from package-lock.json, never whatever happens
+rem to be sitting in node_modules: a stale or tampered tree cannot ship.
+call npm ci
+if errorlevel 1 goto :fail
+
+echo.
+echo === 2/6 Patching known vulnerabilities ===
+rem Patch first, then gate: nothing deploys while npm audit still reports
+rem an advisory, and nothing deploys from a lockfile that is not committed
+rem (the public must be able to rebuild this commit byte-for-byte).
+call npm audit fix
+call npm audit
+if errorlevel 1 (
     echo.
+    echo npm audit still reports vulnerabilities ^(or could not reach the
+    echo registry^). Resolve them before deploying.
+    goto :fail
+)
+git status --porcelain -- package.json package-lock.json | findstr . >nul
+if not errorlevel 1 (
+    git status --short -- package.json package-lock.json
+    echo.
+    echo Dependencies were patched or differ from what is committed. Commit
+    echo them first ^(commit_and_sync.bat^), then deploy again.
+    goto :fail
 )
 
-echo === 1/4 Typecheck and crypto self-test ===
+echo.
+echo === 3/6 Typecheck and crypto self-test ===
 call npm run typecheck
 if errorlevel 1 goto :fail
 call npm test
 if errorlevel 1 goto :fail
 
 echo.
-echo === 2/4 Building vault ===
+echo === 4/6 Building vault ===
 call npm run build:vault
 if errorlevel 1 goto :fail
 
 echo.
-echo === 3/4 Checking dist matches the commit ===
+echo === 5/6 Checking dist matches the commit ===
 rem The public repo's SHA256SUMS is the promise: the live vault must be
 rem byte-for-byte what anyone gets by rebuilding this commit. Refuse to
 rem ship a dist/ that is not committed.
@@ -47,7 +69,7 @@ if not errorlevel 1 (
 )
 
 echo.
-echo === 4/4 Deploying Worker static assets (solfray-keys) ===
+echo === 6/6 Deploying Worker static assets (solfray-keys) ===
 call npx.cmd wrangler deploy
 if errorlevel 1 goto :fail
 
