@@ -30,6 +30,7 @@
   "devDependencies": {
     "@types/node": "22.15.30",
     "esbuild": "0.25.9",
+    "jsqr": "1.4.0",
     "typescript": "5.5.4",
     "uqr": "0.1.2",
     "wrangler": "^4.142.0"

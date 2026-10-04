@@ -14,6 +14,9 @@ await build({
   legalComments: "none",
   charset: "utf8",
   outfile: "dist/vault.js",
+  banner: {
+    js: "/* QR decoding uses jsQR (https://github.com/cozmo/jsQR), Apache License 2.0. */",
+  },
   logLevel: "info",
 });
 

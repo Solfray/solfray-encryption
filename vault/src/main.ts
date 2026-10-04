@@ -4,6 +4,7 @@
 // parent asked to unlock. They never carry the seed or the words.
 
 import { encode } from "uqr";
+import jsQR from "jsqr";
 import { sha256 } from "@noble/hashes/sha2";
 import { utf8ToBytes } from "@noble/hashes/utils";
 import {
@@ -63,6 +64,11 @@ let quizError = "";
 let phraseError = "";
 let linkError = "";
 let stay = true;
+let scanStream: MediaStream | null = null;
+let scanVideo: HTMLVideoElement | null = null;
+let scanGen = 0;
+let copyTimer = 0;
+const scanCanvas = document.createElement("canvas");
 let idleMin = 0;
 let lastActive = Date.now();
 const epochs = new Map<string, Map<number, Uint8Array>>();
@@ -218,11 +224,14 @@ function roomMap(roomId: string): Map<number, Uint8Array> {
 
 function drawQr(canvas: HTMLCanvasElement, text: string): void {
   const qr = encode(text, { ecc: "M", border: 2 });
-  const scale = 4;
+  // Dark modules on a light field. A camera reads that more reliably than an inverted code.
+  const pixels = Math.round(240 * Math.min(window.devicePixelRatio || 1, 3));
+  const scale = Math.max(1, Math.floor(pixels / qr.size));
   canvas.width = qr.size * scale;
   canvas.height = qr.size * scale;
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
+  ctx.imageSmoothingEnabled = false;
   ctx.fillStyle = "#f4f1ea";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = "#161616";
@@ -234,8 +243,160 @@ function drawQr(canvas: HTMLCanvasElement, text: string): void {
   }
 }
 
+function stopCamera(): void {
+  scanGen += 1;
+  const stream = scanStream;
+  scanStream = null;
+  if (stream) {
+    for (const track of stream.getTracks()) track.stop();
+  }
+  if (scanVideo) {
+    scanVideo.srcObject = null;
+    scanVideo.hidden = true;
+    scanVideo = null;
+  }
+}
+
+function selectContents(node: HTMLElement): void {
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  const sel = window.getSelection();
+  if (!sel) return;
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+/** The parent receives the SHA-256 only. The code stays in this frame. */
+function postCodeHash(code: string): void {
+  ui("link-hash", { codeHash: hex(sha256(utf8ToBytes(code))) });
+}
+
+type QrDetector = { detect: (source: CanvasImageSource) => Promise<Array<{ rawValue?: string }>> };
+
+function nativeDetector(): QrDetector | null {
+  const host = window as unknown as {
+    BarcodeDetector?: new (opts?: { formats?: string[] }) => QrDetector;
+  };
+  if (typeof host.BarcodeDetector !== "function") return null;
+  try {
+    return new host.BarcodeDetector({ formats: ["qr_code"] });
+  } catch {
+    return null;
+  }
+}
+
+function readQrFrame(video: HTMLVideoElement): string {
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (!w || !h) return "";
+  const scale = w > 480 ? 480 / w : 1;
+  const cw = Math.max(1, Math.round(w * scale));
+  const ch = Math.max(1, Math.round(h * scale));
+  scanCanvas.width = cw;
+  scanCanvas.height = ch;
+  const ctx = scanCanvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return "";
+  ctx.drawImage(video, 0, 0, cw, ch);
+  const image = ctx.getImageData(0, 0, cw, ch);
+  const hit = jsQR(image.data, image.width, image.height, { inversionAttempts: "dontInvert" });
+  return hit?.data ?? "";
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+async function startScan(video: HTMLVideoElement, lead: HTMLElement, onReady: () => void, onHit: (code: string) => void): Promise<void> {
+  stopCamera();
+  const gen = scanGen;
+  if (!navigator.mediaDevices?.getUserMedia) {
+    lead.textContent = "The camera is unavailable. Paste the code.";
+    return;
+  }
+  let stream: MediaStream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" },
+      audio: false,
+    });
+  } catch {
+    lead.textContent = "The camera is unavailable. Paste the code.";
+    return;
+  }
+  if (gen !== scanGen || panel !== "link-take" || !video.isConnected) {
+    for (const track of stream.getTracks()) track.stop();
+    return;
+  }
+  scanStream = stream;
+  scanVideo = video;
+  video.srcObject = stream;
+  video.muted = true;
+  video.playsInline = true;
+  try {
+    await video.play();
+  } catch {
+    stopCamera();
+    lead.textContent = "The camera is unavailable. Paste the code.";
+    return;
+  }
+  if (gen !== scanGen || panel !== "link-take" || !video.isConnected) {
+    stopCamera();
+    return;
+  }
+  onReady();
+  const detector = nativeDetector();
+  while (gen === scanGen && panel === "link-take" && video.isConnected) {
+    let text = "";
+    try {
+      if (detector) {
+        const codes = await detector.detect(video);
+        text = codes[0]?.rawValue ?? "";
+      } else {
+        text = readQrFrame(video);
+      }
+    } catch {
+      text = "";
+    }
+    const trimmed = text.trim();
+    if (trimmed.length >= 8 && trimmed.length <= 128) {
+      stopCamera();
+      onHit(trimmed);
+      return;
+    }
+    if (trimmed) lead.textContent = "That code is not valid. Paste the code.";
+    await delay(200);
+  }
+}
+
+let sizeFrame = 0;
+
+function scheduleSize(): void {
+  if (sizeFrame) return;
+  sizeFrame = window.requestAnimationFrame(() => {
+    sizeFrame = 0;
+    const root = app;
+    if (!root || window.parent === window) return;
+    ui("size", { scrollHeight: root.scrollHeight });
+  });
+}
+
 function render(): void {
+  stopCamera();
+  if (copyTimer) {
+    window.clearTimeout(copyTimer);
+    copyTimer = 0;
+  }
   app!.replaceChildren();
+  try {
+    renderPanel();
+  } finally {
+    scheduleSize();
+  }
+}
+
+function renderPanel(): void {
   if (window.parent === window) {
     app!.append(
       el("p", {
@@ -331,26 +492,95 @@ function render(): void {
     return;
   }
   if (panel === "link-make") {
-    app!.append(
-      el("p", {
-        text: "This code works once, for five minutes. The other device can paste it. Both screens should show the same sigil.",
-      })
-    );
+    const lead = el("p", {
+      className: "quiet",
+      text: "This code works once, for five minutes. The other device can scan it or paste it. Both screens should show the same name.",
+    });
+    app!.append(lead);
     if (!linkCode) {
       app!.append(el("p", { className: "quiet", text: "Making the code…" }));
       return;
     }
-    app!.append(el("p", { className: "words", text: linkCode }));
+    const well = el("p", { className: "words code", text: linkCode });
+    const copy = el("button", { className: "secondary", text: "Copy code" });
+    copy.addEventListener("click", () => {
+      const copied = () => {
+        copy.textContent = "Copied";
+        if (copyTimer) window.clearTimeout(copyTimer);
+        copyTimer = window.setTimeout(() => {
+          copyTimer = 0;
+          if (copy.isConnected) copy.textContent = "Copy code";
+        }, 2000);
+      };
+      const refused = () => {
+        selectContents(well);
+        lead.textContent = "Select the code and copy it.";
+      };
+      const clip = navigator.clipboard;
+      if (!clip?.writeText) {
+        refused();
+        return;
+      }
+      void clip.writeText(linkCode).then(copied, refused);
+    });
     const canvas = el("canvas");
+    canvas.className = "qr";
     drawQr(canvas, linkCode);
-    app!.append(canvas);
+    app!.append(
+      well,
+      el("div", { className: "row" }, [copy]),
+      canvas,
+      el("p", { className: "quiet", text: "Point the other device's camera here." })
+    );
     return;
   }
   if (panel === "link-take") {
-    app!.append(el("p", { text: "Paste the code from the other device." }));
+    const lead = el("p", { className: "quiet", text: "Paste the code, or scan it." });
+    const video = el("video");
+    video.className = "scan";
+    video.muted = true;
+    video.playsInline = true;
+    video.autoplay = true;
+    video.setAttribute("playsinline", "");
+    video.hidden = true;
     const input = el("input");
     input.autocomplete = "off";
     input.spellcheck = false;
+    input.autocapitalize = "off";
+    const scan = el("button", { className: "secondary", text: "Scan the code" });
+    const stop = el("button", { className: "secondary", text: "Stop" });
+    const row = el("div", { className: "row" }, [scan]);
+    const showScan = () => {
+      stop.remove();
+      video.hidden = true;
+      if (!scan.isConnected) row.append(scan);
+    };
+    scan.addEventListener("click", () => {
+      void startScan(
+        video,
+        lead,
+        () => {
+          video.hidden = false;
+          scan.remove();
+          if (!stop.isConnected) row.append(stop);
+          scheduleSize();
+        },
+        (code) => {
+          showScan();
+          input.value = code;
+          linkCode = code;
+          linkError = "";
+          postCodeHash(code);
+          scheduleSize();
+        }
+      );
+    });
+    stop.addEventListener("click", () => {
+      stopCamera();
+      showScan();
+      lead.textContent = "Paste the code, or scan it.";
+      scheduleSize();
+    });
     const button = el("button", { text: "Use this code" });
     button.addEventListener("click", () => {
       const code = input.value.trim();
@@ -361,9 +591,9 @@ function render(): void {
       }
       linkCode = code;
       linkError = "";
-      ui("link-hash", { codeHash: hex(sha256(utf8ToBytes(code))) });
+      postCodeHash(code);
     });
-    app!.append(input);
+    app!.append(lead, video, row, input);
     if (linkError) app!.append(el("p", { className: "err", text: linkError }));
     app!.append(el("div", { className: "row" }, [button]));
   }
@@ -691,6 +921,19 @@ window.setInterval(() => {
     render();
   }
 }, 15_000);
+
+const watched = document.querySelector("#app");
+if (watched) new ResizeObserver(() => scheduleSize()).observe(watched);
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "hidden") return;
+  // Drop a camera that is still opening. An open preview is cleared by render.
+  if (!scanStream) {
+    stopCamera();
+    return;
+  }
+  render();
+});
 
 render();
 if (window.parent !== window) post(window.parent, PARENT, { t: "vault-ready" });
