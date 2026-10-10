@@ -7,7 +7,19 @@ import { signEncryption, verifyEncryption } from "./account.js";
 import { base58Decode } from "./base58.js";
 import { b64urlToBytes, bytesToB64url, concatBytes } from "./codec.js";
 
-const WRAP_INFO = utf8ToBytes("solfray-wrap-v1");
+const WRAP_INFO_V1 = utf8ToBytes("solfray-wrap-v1");
+const WRAP_INFO_V2 = utf8ToBytes("solfray-wrap-v2");
+
+/** Wraps and epoch signatures are version 2 since 2026-10-10. Version 1
+ *  wraps carried no room, epoch, or member binding, and the version 1 epoch
+ *  signature did not cover the wrap list, so a server could move a wrap
+ *  between epochs or swap one. Clients read v1 only to rekey away from it. */
+export const EPOCH_SIG_V = 2;
+
+/** Plaintext is padded to this many bytes before encryption so ciphertext
+ *  length reveals only a bucket, not the exact message length. Same bucket
+ *  size Signal uses. */
+export const PAD_BLOCK = 160;
 
 function utf8FromBytes(b: Uint8Array): string {
   return new TextDecoder().decode(b);
@@ -27,31 +39,76 @@ export function aadBytes(roomId: string, epoch: number, authorPk: string): Uint8
   return utf8ToBytes(`solfray-e2e-v1|${roomId}|${epoch}|${authorPk}`);
 }
 
-/** Seal a 32-byte epoch key to one member's X25519 public key.
- *  Layout: ephPub (32) || nonce (24) || ciphertext. Returned as base64url. */
-export function wrapEpochKey(epochKey: Uint8Array, memberXPub: Uint8Array): string {
+/** What a wrap is bound to. A wrap made for one room, epoch, and member
+ *  opens nowhere else, so the server cannot present an old epoch's wrap
+ *  (a key a removed member still holds) as the current one. */
+export interface WrapContext {
+  roomId: string;
+  epoch: number;
+  memberPk: string;
+}
+
+export function wrapAad(ctx: WrapContext): Uint8Array {
+  return utf8ToBytes(`solfray-wrap-v2|${ctx.roomId}|${ctx.epoch}|${ctx.memberPk}`);
+}
+
+/** Seal a 32-byte epoch key to one member's X25519 public key, bound to
+ *  the room, epoch, and member (v2). Layout: ephPub (32) || nonce (24) ||
+ *  ciphertext. Returned as base64url. The KDF salt covers both public keys
+ *  so the derived key is bound to the recipient as well. */
+export function wrapEpochKey(epochKey: Uint8Array, memberXPub: Uint8Array, ctx: WrapContext): string {
   if (epochKey.length !== 32) throw new Error("bad_epoch_key");
   if (memberXPub.length !== 32) throw new Error("bad_x25519");
   const eph = randomBytes(32);
   const ephPub = x25519.getPublicKey(eph);
   const shared = x25519.getSharedSecret(eph, memberXPub);
-  const key = hkdf(sha256, shared, ephPub, WRAP_INFO, 32);
+  const key = hkdf(sha256, shared, concatBytes(ephPub, memberXPub), WRAP_INFO_V2, 32);
   const nonce = randomBytes(24);
-  const ct = xchacha20poly1305(key, nonce).encrypt(epochKey);
+  const ct = xchacha20poly1305(key, nonce, wrapAad(ctx)).encrypt(epochKey);
   return bytesToB64url(concatBytes(ephPub, nonce, ct));
 }
 
-export function unwrapEpochKey(wrappedB64: string, xSecret: Uint8Array): Uint8Array {
+export function unwrapEpochKey(wrappedB64: string, xSecret: Uint8Array, ctx: WrapContext): Uint8Array {
+  const raw = b64urlToBytes(wrappedB64);
+  if (raw.length < 32 + 24 + 16) throw new Error("bad_wrap");
+  const ephPub = raw.slice(0, 32);
+  const nonce = raw.slice(32, 56);
+  const ct = raw.slice(56);
+  const myPub = x25519.getPublicKey(xSecret);
+  const shared = x25519.getSharedSecret(xSecret, ephPub);
+  const key = hkdf(sha256, shared, concatBytes(ephPub, myPub), WRAP_INFO_V2, 32);
+  const opened = xchacha20poly1305(key, nonce, wrapAad(ctx)).decrypt(ct);
+  if (opened.length !== 32) throw new Error("bad_wrap");
+  return opened;
+}
+
+/** Open a version 1 wrap (no binding). Only for reading epochs made before
+ *  2026-10-10 so a member can rekey the room onto v2. Never used to seal. */
+export function unwrapEpochKeyV1(wrappedB64: string, xSecret: Uint8Array): Uint8Array {
   const raw = b64urlToBytes(wrappedB64);
   if (raw.length < 32 + 24 + 16) throw new Error("bad_wrap");
   const ephPub = raw.slice(0, 32);
   const nonce = raw.slice(32, 56);
   const ct = raw.slice(56);
   const shared = x25519.getSharedSecret(xSecret, ephPub);
-  const key = hkdf(sha256, shared, ephPub, WRAP_INFO, 32);
+  const key = hkdf(sha256, shared, ephPub, WRAP_INFO_V1, 32);
   const opened = xchacha20poly1305(key, nonce).decrypt(ct);
   if (opened.length !== 32) throw new Error("bad_wrap");
   return opened;
+}
+
+export interface EpochWrap {
+  member_pk: string;
+  wrapped: string;
+}
+
+/** One hash over the whole wrap list, sorted by member, so the epoch
+ *  signature covers every wrap and every recipient. */
+export function wrapsDigest(wraps: EpochWrap[]): string {
+  const lines = [...wraps]
+    .sort((a, b) => (a.member_pk < b.member_pk ? -1 : a.member_pk > b.member_pk ? 1 : 0))
+    .map((w) => `${w.member_pk}:${w.wrapped}`);
+  return bytesToB64url(sha256(utf8ToBytes(lines.join("\n"))));
 }
 
 export function newEpochKey(): Uint8Array {
@@ -96,7 +153,7 @@ export function sealMessage(
   const body: PlainMessage = { text: plain.text };
   if (plain.mentions && plain.mentions.length) body.mentions = plain.mentions.slice(0, 10);
   if (typeof plain.reply_to === "number") body.reply_to = plain.reply_to;
-  const pt = utf8ToBytes(JSON.stringify(body));
+  const pt = padPlain(utf8ToBytes(JSON.stringify(body)));
   const nonce = randomBytes(24);
   const aad = aadBytes(roomId, epoch, authorPk);
   const ciphertext = xchacha20poly1305(epochKey, nonce, aad).encrypt(pt);
@@ -152,7 +209,7 @@ export function openMessage(
   try {
     const aad = aadBytes(roomId, parts.epoch, parts.authorPk);
     const pt = xchacha20poly1305(epochKey, parts.nonce, aad).decrypt(parts.ciphertext);
-    const o = JSON.parse(utf8FromBytes(pt)) as PlainMessage;
+    const o = JSON.parse(utf8FromBytes(unpadPlain(pt))) as PlainMessage;
     if (!o || typeof o.text !== "string") return null;
     return o;
   } catch {
@@ -160,8 +217,59 @@ export function openMessage(
   }
 }
 
-/** Epoch announcement the creator's encryption key signs. Members are the
- *  wallet public keys, sorted, comma-joined. */
+/** ISO 7816-4 padding: one 0x80 byte, then zeros, up to a PAD_BLOCK
+ *  boundary. A message made before padding existed ends in `}` and is left
+ *  alone by unpadPlain. */
+export function padPlain(pt: Uint8Array): Uint8Array {
+  const len = Math.ceil((pt.length + 1) / PAD_BLOCK) * PAD_BLOCK;
+  const out = new Uint8Array(len);
+  out.set(pt);
+  out[pt.length] = 0x80;
+  return out;
+}
+
+export function unpadPlain(pt: Uint8Array): Uint8Array {
+  let end = pt.length;
+  while (end > 0 && pt[end - 1] === 0) end--;
+  if (end > 0 && pt[end - 1] === 0x80) return pt.slice(0, end - 1);
+  return pt;
+}
+
+/** Version 2 epoch announcement. The signer's encryption key signs the
+ *  room, the epoch number, the sorted member list, and the digest of the
+ *  wrap list. A server that replaces or moves one wrap breaks the digest. */
+export function epochSignBytesV2(roomId: string, epoch: number, wraps: EpochWrap[]): Uint8Array {
+  const members = wraps.map((w) => w.member_pk).sort().join(",");
+  return utf8ToBytes(
+    "Solfray chat epoch v2\n" +
+      `room: ${roomId}\n` +
+      `epoch: ${epoch}\n` +
+      `members: ${members}\n` +
+      `wraps: ${wrapsDigest(wraps)}\n`
+  );
+}
+
+export function signEpochV2(edSecret: Uint8Array, roomId: string, epoch: number, wraps: EpochWrap[]): string {
+  return bytesToB64url(signEncryption(edSecret, epochSignBytesV2(roomId, epoch, wraps)));
+}
+
+export function verifyEpochV2(
+  sigB64: string,
+  edPub: Uint8Array,
+  roomId: string,
+  epoch: number,
+  wraps: EpochWrap[]
+): boolean {
+  try {
+    return verifyEncryption(edPub, epochSignBytesV2(roomId, epoch, wraps), b64urlToBytes(sigB64));
+  } catch {
+    return false;
+  }
+}
+
+/** Version 1 epoch announcement (before 2026-10-10). Members are the
+ *  wallet public keys, sorted, comma-joined. The wrap list was not signed.
+ *  Kept so old rows can be recognized; nothing new is signed this way. */
 export function epochSignBytes(roomId: string, epoch: number, memberPks: string[]): Uint8Array {
   const members = [...memberPks].sort().join(",");
   return utf8ToBytes(

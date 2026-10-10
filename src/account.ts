@@ -95,6 +95,49 @@ export function sigilOf(edPub: Uint8Array): { words: string[]; color: string } {
   return { words, color };
 }
 
+/** The full fingerprint: SHA-256 of the encryption public key, 64 hex
+ *  digits in groups of four. The sigil is 66 bits and is a name. This is
+ *  the whole hash, for people who want to compare every digit. */
+export function fingerprintOf(edPub: Uint8Array): string {
+  const h = sha256(edPub);
+  const hex = [...h].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return (hex.match(/.{4}/g) ?? []).join(" ");
+}
+
+/** A published key row as the directory returns it. `prev_ed25519` is set
+ *  when the row came from a rekey; its attestation is then the rotate text. */
+export interface KeyRowLike {
+  pk: string;
+  x25519_pub: string;
+  ed25519_pub: string;
+  attestation: string;
+  created_at: string;
+  prev_ed25519?: string | null;
+}
+
+/** Every client runs this on every key it did not make itself. A row the
+ *  wallet did not sign is treated as no key at all. This is what stops a
+ *  compromised directory from handing out a substitute key. */
+export function verifyKeyRow(row: KeyRowLike): boolean {
+  try {
+    const x = base58Decode(row.x25519_pub);
+    const ed = base58Decode(row.ed25519_pub);
+    if (x.length !== 32 || ed.length !== 32) return false;
+    if (typeof row.created_at !== "string" || /[\r\n]/.test(row.created_at)) return false;
+    let text: string;
+    if (row.prev_ed25519) {
+      const prev = base58Decode(row.prev_ed25519);
+      if (prev.length !== 32) return false;
+      text = rotateText(row.pk, prev, x, ed, row.created_at);
+    } else {
+      text = attestationText(row.pk, x, ed, row.created_at);
+    }
+    return verifyWalletSig(row.pk, text, row.attestation);
+  } catch {
+    return false;
+  }
+}
+
 function elevenBits(h: Uint8Array, bit: number): number {
   const byte = bit >> 3;
   const shift = bit & 7;

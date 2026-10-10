@@ -8,6 +8,7 @@ import jsQR from "jsqr";
 import { sha256 } from "@noble/hashes/sha2";
 import { utf8ToBytes } from "@noble/hashes/utils";
 import {
+  EPOCH_SIG_V,
   accountFromPhrase,
   b64ToBytes,
   bytesToB64url,
@@ -26,10 +27,12 @@ import {
   sealBytes,
   sealMessage,
   sealVault,
-  signEpoch,
+  signEpochV2,
   signOffVote,
   sigilOf,
   unwrapEpochKey,
+  unwrapEpochKeyV1,
+  verifyKeyRow,
   walletSignaturePassword,
   wrapEpochKey,
   type AccountKey,
@@ -50,6 +53,8 @@ interface OpenKey {
 interface WrapIn {
   epoch: number;
   wrapped: string;
+  /** 1 for wraps made before 2026-10-10. Absent or 2 is a bound wrap. */
+  v?: number;
 }
 
 let wallet = "";
@@ -195,13 +200,34 @@ async function readStoredSeed(pk: string): Promise<Uint8Array | null> {
   }
 }
 
+async function idbDel(key: string): Promise<void> {
+  const db = await openDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("idb_del"));
+    });
+  } finally {
+    db.close();
+  }
+}
+
+/** "Stay unlocked" off means no copy of the seed on disk at all, not a
+ *  copy that is merely ignored. */
 async function writeStoredSeed(pk: string, seed: Uint8Array, stayOn: boolean): Promise<void> {
+  if (!stayOn) {
+    await idbDel("seed:" + pk);
+    await idbSet("stay:" + pk, false);
+    return;
+  }
   const key = await wrappingKey();
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, seed));
   await idbSet("seed:" + pk, { iv: [...iv], ct: [...ct] });
-  await idbSet("stay:" + pk, stayOn);
-  if (stayOn) clearSessionLock(pk);
+  await idbSet("stay:" + pk, true);
+  clearSessionLock(pk);
 }
 
 function post(target: Window, origin: string, data: unknown): void {
@@ -604,6 +630,37 @@ function asRecord(body: unknown): Record<string, unknown> {
   return body as Record<string, unknown>;
 }
 
+interface MemberIn {
+  pk?: unknown;
+  x25519?: unknown;
+  ed25519?: unknown;
+  attestation?: unknown;
+  created_at?: unknown;
+  prev_ed25519?: unknown;
+}
+
+/** The wallet signed this exact key, or it is this vault's own key (the
+ *  open one, or the one a rekey is about to publish). */
+function memberAttested(member: MemberIn, mine: AccountKey): boolean {
+  if (typeof member.pk !== "string" || typeof member.x25519 !== "string") return false;
+  if (member.pk === wallet) {
+    if (member.x25519 === pubB58(mine.x25519Pub)) return true;
+    if (pending && quizzed && member.x25519 === pubB58(pending.x25519Pub)) return true;
+    return false;
+  }
+  if (typeof member.ed25519 !== "string" || typeof member.attestation !== "string" || typeof member.created_at !== "string") {
+    return false;
+  }
+  return verifyKeyRow({
+    pk: member.pk,
+    x25519_pub: member.x25519,
+    ed25519_pub: member.ed25519,
+    attestation: member.attestation,
+    created_at: member.created_at,
+    prev_ed25519: typeof member.prev_ed25519 === "string" ? member.prev_ed25519 : null,
+  });
+}
+
 function needAccount(): AccountKey {
   if (!account) throw new Error("e2e_locked");
   return account;
@@ -693,8 +750,14 @@ async function onRpc(op: string, raw: unknown): Promise<unknown> {
   if (op === "setStay") {
     if (!wallet) throw new Error("e2e_locked");
     stay = body.stay === true;
-    await idbSet("stay:" + wallet, stay);
-    if (stay) clearSessionLock(wallet);
+    if (stay) {
+      if (account) await writeStoredSeed(wallet, account.seed, true);
+      else await idbSet("stay:" + wallet, true);
+      clearSessionLock(wallet);
+    } else {
+      await idbDel("seed:" + wallet);
+      await idbSet("stay:" + wallet, false);
+    }
     return { stay };
   }
   if (op === "setIdle") {
@@ -714,14 +777,20 @@ async function onRpc(op: string, raw: unknown): Promise<unknown> {
   if (op === "hold") {
     if (typeof body.roomId !== "string" || !Array.isArray(body.wraps)) throw new Error("bad_request");
     const map = roomMap(body.roomId);
-    if (account) {
+    if (account && wallet) {
       for (const wrap of body.wraps as WrapIn[]) {
         if (!wrap || typeof wrap.epoch !== "number" || typeof wrap.wrapped !== "string") continue;
         if (map.has(wrap.epoch)) continue;
         try {
-          map.set(wrap.epoch, unwrapEpochKey(wrap.wrapped, account.x25519Secret));
+          // A v2 wrap opens only for this room, this epoch, and this wallet.
+          // A v1 wrap (before 2026-10-10) is opened so the room can be rekeyed onto v2.
+          const key =
+            wrap.v === 1
+              ? unwrapEpochKeyV1(wrap.wrapped, account.x25519Secret)
+              : unwrapEpochKey(wrap.wrapped, account.x25519Secret, { roomId: body.roomId, epoch: wrap.epoch, memberPk: wallet });
+          map.set(wrap.epoch, key);
         } catch {
-          /* a wrap for a key this vault does not hold */
+          /* a wrap for a key this vault does not hold, or one moved from elsewhere */
         }
       }
     }
@@ -732,6 +801,9 @@ async function onRpc(op: string, raw: unknown): Promise<unknown> {
     if (typeof body.roomId !== "string" || typeof body.epoch !== "number" || typeof body.authorPk !== "string") {
       throw new Error("bad_request");
     }
+    // The author is the wallet this vault booted for. The parent cannot ask
+    // the vault to sign as someone else.
+    if (!wallet || body.authorPk !== wallet) throw new Error("bad_request");
     if (typeof body.text !== "string") throw new Error("bad_request");
     const epochKey = epochs.get(body.roomId)?.get(body.epoch);
     if (!epochKey) throw new Error("e2e_locked");
@@ -812,39 +884,46 @@ async function onRpc(op: string, raw: unknown): Promise<unknown> {
     }
     const reason = body.reason;
     if (reason !== "on" && reason !== "rekey" && reason !== "join" && reason !== "leave") throw new Error("bad_request");
-    const members = body.members as { pk?: unknown; x25519?: unknown }[];
-    const pks: string[] = [];
-    const epochKey = newEpochKey();
-    const wraps = members.map((member) => {
-      if (typeof member.pk !== "string" || typeof member.x25519 !== "string") throw new Error("e2e_member_keyless");
+    const members = body.members as MemberIn[];
+    const roomId = body.roomId;
+    const epochNo = body.epoch;
+    // Every recipient key is checked against its wallet signature here, in
+    // the vault, before anything is wrapped for it. The parent did the same
+    // check; this one holds even if the parent is compromised.
+    const verified = members.map((member) => {
+      if (!member || typeof member.pk !== "string" || typeof member.x25519 !== "string") throw new Error("e2e_member_keyless");
       const pub = edPubFromB58(member.x25519);
       if (!pub) throw new Error("e2e_member_keyless");
-      pks.push(member.pk);
-      return { member_pk: member.pk, wrapped: wrapEpochKey(epochKey, pub) };
+      if (!memberAttested(member, key)) throw new Error("e2e_bad_attestation");
+      return { pk: member.pk, pub };
     });
-    roomMap(body.roomId).set(body.epoch, epochKey);
+    const epochKey = newEpochKey();
+    const wraps = verified.map((m) => ({
+      member_pk: m.pk,
+      wrapped: wrapEpochKey(epochKey, m.pub, { roomId, epoch: epochNo, memberPk: m.pk }),
+    }));
+    roomMap(roomId).set(epochNo, epochKey);
     const olderEpochs = Array.isArray(body.olderEpochs) ? body.olderEpochs.filter((n): n is number => typeof n === "number") : [];
     const olderFor = Array.isArray(body.olderFor) ? body.olderFor.filter((s): s is string => typeof s === "string") : [];
     const older = [];
-    const map = epochs.get(body.roomId)!;
+    const map = epochs.get(roomId)!;
     for (const epoch of olderEpochs) {
-      if (epoch >= body.epoch) continue;
+      if (epoch >= epochNo) continue;
       const old = map.get(epoch);
       if (!old) continue;
       const wrapped = [];
       for (const pk of olderFor) {
-        const member = members.find((m) => m.pk === pk);
-        if (!member || typeof member.x25519 !== "string") throw new Error("e2e_member_keyless");
-        const pub = edPubFromB58(member.x25519);
-        if (!pub) throw new Error("e2e_member_keyless");
-        wrapped.push({ member_pk: pk, wrapped: wrapEpochKey(old, pub) });
+        const member = verified.find((m) => m.pk === pk);
+        if (!member) throw new Error("e2e_member_keyless");
+        wrapped.push({ member_pk: pk, wrapped: wrapEpochKey(old, member.pub, { roomId, epoch, memberPk: pk }) });
       }
       if (wrapped.length) older.push({ epoch, wraps: wrapped });
     }
     return {
-      epoch: body.epoch,
+      epoch: epochNo,
       wraps,
-      signature: signEpoch(key.ed25519Secret, body.roomId, body.epoch, pks),
+      signature: signEpochV2(key.ed25519Secret, roomId, epochNo, wraps),
+      sig_v: EPOCH_SIG_V,
       reason,
       ...(older.length ? { older } : {}),
     };
